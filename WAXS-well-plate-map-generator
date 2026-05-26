@@ -1,0 +1,216 @@
+"""
+Generate WAXS sample well assignments and 96-well plate inventory maps.
+
+This script:
+1. Reads a CSV inventory file containing sample names.
+2. Assigns each sample to an allowed well position in a 96-well plate.
+3. Skips mounting/alignment wells and unused checkerboard positions.
+4. Writes the updated well assignments back to CSV.
+5. Generates plate maps showing sample locations and abbreviations.
+"""
+
+from pathlib import Path
+import csv
+
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+INVENTORY_CSV = Path() #update
+
+WELL_COLUMN_NAME = "well_number"
+START_WELL_INDEX = 1  # Starts at A2 because A1 is reserved
+
+OMITTED_WELLS = {
+    "A1", "A12", "H1", "H12",
+    "A11", "B12", "G1", "H2",
+}
+
+ROWS = "ABCDEFGH"
+COLUMNS = range(1, 13)
+
+
+def generate_well_name(index: int) -> str:
+    """Convert a zero-based index into a 96-well plate position."""
+    index %= 96
+    row = ROWS[index // 12]
+    column = (index % 12) + 1
+    return f"{row}{column}"
+
+
+def is_allowed_well(well_name: str) -> bool:
+    """
+    Return True if the well can be used for a sample.
+
+    The pattern skips:
+    - Omitted mounting/alignment wells.
+    - Checkerboard positions not used for sample loading.
+    """
+    row = well_name[0]
+    column = int(well_name[1:])
+
+    if well_name in OMITTED_WELLS:
+        return False
+
+    # Checkerboard loading pattern
+    if row in "BDFH" and column % 2 == 0:
+        return False
+    if row in "ACEG" and column % 2 != 0:
+        return False
+
+    return True
+
+
+def get_allowed_wells() -> list[str]:
+    """Return all allowed wells on one 96-well plate."""
+    return [
+        f"{row}{column}"
+        for row in ROWS
+        for column in COLUMNS
+        if is_allowed_well(f"{row}{column}")
+    ]
+
+
+def read_inventory(csv_path: Path) -> list[dict[str, str]]:
+    """Read the inventory CSV into a list of dictionaries."""
+    with csv_path.open("r", newline="") as infile:
+        return list(csv.DictReader(infile))
+
+
+def write_inventory(
+    csv_path: Path,
+    rows: list[dict[str, str]],
+    fieldnames: list[str],
+) -> None:
+    """Write the updated inventory back to CSV."""
+    with csv_path.open("w", newline="") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def assign_wells(
+    inventory_rows: list[dict[str, str]],
+    sample_column: str,
+    well_column: str = WELL_COLUMN_NAME,
+) -> list[dict[str, str]]:
+    """Assign plate and well locations to each sample."""
+    allowed_wells = get_allowed_wells()
+    wells_per_plate = len(allowed_wells)
+
+    for sample_index, row in enumerate(inventory_rows):
+        plate_number = (sample_index // wells_per_plate) + 1
+        well_name = allowed_wells[sample_index % wells_per_plate]
+        sample_name = row[sample_column]
+
+        row[well_column] = f"P{plate_number} - {well_name} - {sample_name}"
+
+    return inventory_rows
+
+
+def group_wells_by_plate(
+    inventory_rows: list[dict[str, str]],
+    well_column: str = WELL_COLUMN_NAME,
+) -> dict[str, dict[str, str]]:
+    """Group assigned wells by plate number."""
+    plate_maps: dict[str, dict[str, str]] = {}
+
+    for row in inventory_rows:
+        plate, well, sample = row[well_column].split(" - ", maxsplit=2)
+        plate_maps.setdefault(plate, {})[well] = sample
+
+    return plate_maps
+
+
+def plot_plate_map(
+    well_sample_map: dict[str, str],
+    plate_name: str,
+    output_dir: Path | None = None,
+) -> None:
+    """Plot a 96-well plate inventory map."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for row_index, row_letter in enumerate(ROWS):
+        for col in COLUMNS:
+            well_name = f"{row_letter}{col}"
+            x = col - 1
+            y = 7 - row_index
+
+            is_loaded = well_name in well_sample_map
+            facecolor = "lightgray" if is_loaded else "white"
+
+            ax.add_patch(
+                plt.Rectangle(
+                    (x, y),
+                    1,
+                    1,
+                    facecolor=facecolor,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+            )
+
+            label = well_name
+            if is_loaded:
+                label += f"\n{well_sample_map[well_name]}"
+
+            ax.text(
+                x + 0.5,
+                y + 0.5,
+                label,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+
+    ax.set_xlim(0, 12)
+    ax.set_ylim(0, 8)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(f"{plate_name} WAXS Sample Map")
+    plt.tight_layout()
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"{plate_name}_waxs_plate_map.png"
+        plt.savefig(output_file, dpi=300)
+        plt.close()
+    else:
+        plt.show()
+
+
+def main() -> None:
+    """Assign wells and generate WAXS inventory plate maps."""
+    inventory_rows = read_inventory(INVENTORY_CSV)
+
+    # Assumes the first column contains the sample abbreviation/name
+    sample_column = list(inventory_rows[0].keys())[0]
+    fieldnames = list(inventory_rows[0].keys())
+
+    if WELL_COLUMN_NAME not in fieldnames:
+        fieldnames.append(WELL_COLUMN_NAME)
+
+    updated_rows = assign_wells(
+        inventory_rows,
+        sample_column=sample_column,
+        well_column=WELL_COLUMN_NAME,
+    )
+
+    write_inventory(INVENTORY_CSV, updated_rows, fieldnames)
+
+    plate_maps = group_wells_by_plate(updated_rows)
+
+    for plate_name, well_sample_map in plate_maps.items():
+        plot_plate_map(
+            well_sample_map,
+            plate_name,
+            output_dir=INVENTORY_CSV.parent,
+        )
+
+    print(f"Updated well assignments and generated {len(plate_maps)} plate map(s).")
+
+
+if __name__ == "__main__":
+    main()
