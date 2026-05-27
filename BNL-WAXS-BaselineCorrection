@@ -1,0 +1,391 @@
+"""
+Process fiber WAXS scattering profiles with Kapton subtraction
+and SNIP baseline correction.
+
+This script:
+1. Loads replicate .dat scattering profiles.
+2. Groups files by sample name.
+3. Interpolates and averages replicate scans.
+4. Averages Kapton blank measurements.
+5. Performs Kapton background subtraction with y-offset matching.
+6. Applies SNIP baseline correction.
+7. Exports corrected scattering profiles to CSV.
+8. Saves diagnostic processing plots.
+"""
+
+from collections import defaultdict
+from pathlib import Path
+import csv
+
+import matplotlib.pyplot as plt
+import numpy as np
+from pybaselines import Baseline
+from scipy.interpolate import interp1d
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+DATA_DIR = Path(
+    r"C:\Users\ndmamrol\OneDrive - Massachusetts Institute of Technology"
+    r"\Graduate School\Polymer Science Research"
+    r"\fiber spinning\XRD\20260306_dat_files_v1"
+)
+
+OUTPUT_DIR = Path(
+    r"C:\Users\ndmamrol\OneDrive - Massachusetts Institute of Technology"
+    r"\Graduate School\Polymer Science Research"
+    r"\fiber spinning\XRD\20260326_dat_files_v2"
+)
+
+FILE_PATTERN = "*_REP*.dat"
+
+Q_MIN = 0.25
+Q_MAX = 2.75
+NUM_INTERP_POINTS = 1700
+
+BACKGROUND_MATCH_Q = 0.4
+BACKGROUND_SEARCH_RANGE = 0.3
+
+SNIP_HALF_WINDOW = 120
+SNIP_SMOOTH_WINDOW = 3
+
+
+# -----------------------------
+# Create output directory
+# -----------------------------
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_dat_file(file_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read q and intensity values from a .dat scattering file.
+    """
+    q_values = []
+    intensities = []
+
+    reading_data = False
+
+    with file_path.open("r") as file:
+
+        for line in file:
+
+            if line.startswith("#"):
+
+                if "# q" in line:
+                    reading_data = True
+
+                continue
+
+            if reading_data:
+
+                columns = line.strip().split()
+
+                if len(columns) >= 2:
+
+                    try:
+                        q_values.append(float(columns[0]))
+                        intensities.append(float(columns[1]))
+
+                    except ValueError:
+                        continue
+
+    return np.array(q_values), np.array(intensities)
+
+
+def parse_sample_name(file_path: Path) -> str:
+    """Extract sample name from filename."""
+    return file_path.stem.split("_REP")[0]
+
+
+def parse_replicate_number(file_path: Path) -> str:
+    """Extract replicate number from filename."""
+    return file_path.stem.split("_REP")[1]
+
+
+def group_profiles_by_sample(
+    data_dir: Path,
+) -> dict[str, list[tuple[str, np.ndarray, np.ndarray]]]:
+    """
+    Group replicate scattering profiles by sample name.
+    """
+    grouped_profiles = defaultdict(list)
+
+    for file_path in sorted(data_dir.glob(FILE_PATTERN)):
+
+        sample_name = parse_sample_name(file_path)
+        replicate_number = parse_replicate_number(file_path)
+
+        q_values, intensities = read_dat_file(file_path)
+
+        grouped_profiles[sample_name].append(
+            (replicate_number, q_values, intensities)
+        )
+
+    return grouped_profiles
+
+
+def interpolate_profile(
+    q_values: np.ndarray,
+    intensities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Interpolate scattering profile onto a common q grid.
+    """
+    interpolation_function = interp1d(
+        q_values,
+        intensities,
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+
+    q_range = np.linspace(Q_MIN, Q_MAX, NUM_INTERP_POINTS)
+
+    interpolated_intensity = interpolation_function(q_range)
+
+    return q_range, interpolated_intensity
+
+
+def average_replicates(
+    replicate_profiles: list[tuple[str, np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Average interpolated replicate scattering profiles.
+    """
+    interpolated_profiles = []
+
+    for _, q_values, intensities in replicate_profiles:
+
+        q_range, interpolated_intensity = interpolate_profile(
+            q_values,
+            intensities,
+        )
+
+        interpolated_profiles.append(interpolated_intensity)
+
+    averaged_profile = np.mean(interpolated_profiles, axis=0)
+
+    return q_range, averaged_profile
+
+
+def calculate_background_offset(
+    q_range: np.ndarray,
+    sample_profile: np.ndarray,
+    blank_profile: np.ndarray,
+) -> float:
+    """
+    Determine y-offset for Kapton blank matching.
+    """
+    indices = np.where(
+        (q_range >= BACKGROUND_MATCH_Q - BACKGROUND_SEARCH_RANGE)
+        & (q_range <= BACKGROUND_MATCH_Q + BACKGROUND_SEARCH_RANGE)
+    )[0]
+
+    if len(indices) == 0:
+        raise ValueError(
+            "No matching q-range found for background alignment."
+        )
+
+    nearest_index = indices[
+        np.argmin(
+            np.abs(q_range[indices] - BACKGROUND_MATCH_Q)
+        )
+    ]
+
+    return (
+        sample_profile[nearest_index]
+        - blank_profile[nearest_index]
+    )
+
+
+def apply_snip_baseline(
+    q_range: np.ndarray,
+    intensity: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply SNIP baseline correction.
+    """
+    baseline_fitter = Baseline(q_range, check_finite=False)
+
+    baseline = baseline_fitter.snip(
+        intensity,
+        max_half_window=SNIP_HALF_WINDOW,
+        decreasing=True,
+        smooth_half_window=SNIP_SMOOTH_WINDOW,
+    )[0]
+
+    corrected_intensity = intensity - baseline
+
+    return baseline, corrected_intensity
+
+
+def export_corrected_profile(
+    output_path: Path,
+    q_range: np.ndarray,
+    corrected_profile: np.ndarray,
+) -> None:
+    """
+    Export corrected scattering profile to CSV.
+    """
+    with output_path.open("w", newline="") as csv_file:
+
+        writer = csv.writer(csv_file)
+
+        for q_value, intensity in zip(q_range, corrected_profile):
+            writer.writerow([q_value, intensity])
+
+
+def plot_processing_results(
+    sample_name: str,
+    q_range: np.ndarray,
+    averaged_profile: np.ndarray,
+    shifted_blank: np.ndarray,
+    background_corrected: np.ndarray,
+    baseline: np.ndarray,
+    corrected_minus_baseline: np.ndarray,
+    output_path: Path,
+) -> None:
+    """
+    Plot WAXS processing workflow for one sample.
+    """
+    plt.figure(figsize=(8, 6))
+
+    plt.plot(
+        q_range,
+        averaged_profile,
+        label="Average Sample",
+        linestyle=":",
+        color="black",
+    )
+
+    plt.plot(
+        q_range,
+        shifted_blank,
+        label="Kapton Background + Offset",
+        color="orchid",
+    )
+
+    plt.plot(
+        q_range,
+        background_corrected,
+        label="Sample - Kapton",
+        color="#4949b7",
+    )
+
+    plt.plot(
+        q_range,
+        baseline,
+        label="SNIP Baseline",
+        color="gray",
+    )
+
+    plt.plot(
+        q_range,
+        corrected_minus_baseline,
+        label="Sample - Baseline & Kapton",
+        linestyle="--",
+        color="darkorange",
+    )
+
+    plt.axhline(
+        y=0,
+        color="black",
+        linestyle=":",
+        linewidth=1,
+    )
+
+    plt.xlabel(r"q ($\mathrm{\AA^{-1}}$)")
+    plt.ylabel("I(q)")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(output_path, dpi=1200, bbox_inches="tight")
+    plt.show()
+
+
+def main() -> None:
+    """
+    Run WAXS processing workflow.
+    """
+    grouped_profiles = group_profiles_by_sample(DATA_DIR)
+
+    kapton_profiles = []
+    sample_profiles = {}
+
+    # -----------------------------
+    # Separate Kapton blanks
+    # -----------------------------
+    for sample_name, replicate_profiles in grouped_profiles.items():
+
+        if sample_name.startswith("kapton_blank_"):
+
+            _, averaged_blank = average_replicates(
+                replicate_profiles
+            )
+
+            kapton_profiles.append(averaged_blank)
+
+        else:
+            sample_profiles[sample_name] = replicate_profiles
+
+    # -----------------------------
+    # Average Kapton blank
+    # -----------------------------
+    kapton_average = np.mean(kapton_profiles, axis=0)
+
+    # -----------------------------
+    # Process samples
+    # -----------------------------
+    for sample_name, replicate_profiles in sample_profiles.items():
+
+        print(f"Processing {sample_name}")
+
+        q_range, averaged_profile = average_replicates(
+            replicate_profiles
+        )
+
+        y_offset = calculate_background_offset(
+            q_range,
+            averaged_profile,
+            kapton_average,
+        )
+
+        shifted_blank = kapton_average + y_offset
+
+        background_corrected = (
+            averaged_profile - shifted_blank
+        )
+
+        baseline, corrected_minus_baseline = apply_snip_baseline(
+            q_range,
+            background_corrected,
+        )
+
+        # Export corrected profile
+        csv_output = OUTPUT_DIR / f"{sample_name}.csv"
+
+        export_corrected_profile(
+            csv_output,
+            q_range,
+            corrected_minus_baseline,
+        )
+
+        # Save processing plot
+        plot_output = OUTPUT_DIR / f"{sample_name}_plot.png"
+
+        plot_processing_results(
+            sample_name,
+            q_range,
+            averaged_profile,
+            shifted_blank,
+            background_corrected,
+            baseline,
+            corrected_minus_baseline,
+            plot_output,
+        )
+
+    print("WAXS processing complete.")
+
+
+if __name__ == "__main__":
+    main()
