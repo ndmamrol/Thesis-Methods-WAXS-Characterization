@@ -1,0 +1,348 @@
+"""
+Process and baseline-correct 1D WAXS scattering profiles.
+
+This script:
+1. Loads raw .dat scattering profiles.
+2. Groups replicate measurements by sample.
+3. Converts q-space data to 2θ.
+4. Interpolates and averages replicate scans.
+5. Performs Kapton background subtraction.
+6. Applies SNIP baseline correction.
+7. Exports corrected scattering profiles to CSV.
+8. Saves diagnostic plots for each sample.
+"""
+
+from collections import defaultdict
+from pathlib import Path
+import csv
+
+import matplotlib.pyplot as plt
+import numpy as np
+from pybaselines import Baseline
+from scipy.interpolate import interp1d
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+WAVELENGTH_ANGSTROM = 1.24
+
+DATA_DIR = Path()
+
+PLOT_OUTPUT_DIR = Path()
+
+CSV_OUTPUT_DIR = Path()
+
+FILE_PATTERN = "P*_*_JOG*.dat"
+
+SNIP_HALF_WINDOW = 70
+SNIP_SMOOTH_WINDOW = 3
+
+BACKGROUND_MATCH_POSITION = 4.5
+BACKGROUND_SEARCH_RANGE = 1.0
+
+X_MIN = 3
+X_MAX = 40.5
+NUM_INTERP_POINTS = 1700
+
+
+# -----------------------------
+# Create output directories
+# -----------------------------
+PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def q_to_2theta(q_values: np.ndarray) -> np.ndarray:
+    """
+    Convert scattering vector q to 2θ.
+
+    Parameters
+    ----------
+    q_values : np.ndarray
+        q values in Å⁻¹.
+
+    Returns
+    -------
+    np.ndarray
+        2θ values in degrees.
+    """
+    return 2 * np.degrees(
+        np.arcsin(q_values * WAVELENGTH_ANGSTROM / (4 * np.pi))
+    )
+
+
+def read_dat_file(file_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read q and intensity data from a .dat scattering profile.
+    """
+    q_values = []
+    intensities = []
+
+    data_section_started = False
+
+    with file_path.open("r") as file:
+        for line in file:
+
+            if line.startswith("#"):
+                if "DataFileName=" in line:
+                    data_section_started = True
+                continue
+
+            if data_section_started:
+                columns = line.strip().split()
+
+                if len(columns) >= 2:
+                    q_values.append(float(columns[0]))
+                    intensities.append(float(columns[1]))
+
+    return np.array(q_values), np.array(intensities)
+
+
+def parse_sample_name(file_path: Path) -> str:
+    """Extract sample name from filename."""
+    return file_path.stem.split("_")[1]
+
+
+def parse_jog_number(file_path: Path) -> str:
+    """Extract JOG replicate number from filename."""
+    return file_path.stem.split("_JOGX")[-1]
+
+
+def group_profiles_by_sample(
+    data_dir: Path,
+) -> dict[str, list[tuple[str, np.ndarray, np.ndarray]]]:
+    """
+    Group replicate WAXS profiles by sample name.
+    """
+    grouped_profiles = defaultdict(list)
+
+    for file_path in sorted(data_dir.glob(FILE_PATTERN)):
+
+        sample_name = parse_sample_name(file_path)
+        jog_number = parse_jog_number(file_path)
+
+        q_values, intensities = read_dat_file(file_path)
+
+        grouped_profiles[sample_name].append(
+            (jog_number, q_values, intensities)
+        )
+
+    return grouped_profiles
+
+
+def interpolate_profiles(
+    profiles: list[tuple[str, np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Interpolate and average replicate WAXS scans.
+    """
+    interpolated_profiles = []
+
+    for _, q_values, intensities in profiles:
+
+        two_theta = q_to_2theta(q_values)
+
+        interpolation_function = interp1d(
+            two_theta,
+            intensities,
+            bounds_error=False,
+            fill_value="extrapolate",
+        )
+
+        x_range = np.linspace(X_MIN, X_MAX, NUM_INTERP_POINTS)
+
+        interpolated_profiles.append(
+            interpolation_function(x_range)
+        )
+
+    averaged_profile = np.mean(interpolated_profiles, axis=0)
+
+    return x_range, averaged_profile
+
+
+def calculate_background_scaling(
+    x_range: np.ndarray,
+    sample_profile: np.ndarray,
+    blank_profile: np.ndarray,
+) -> float:
+    """
+    Determine scaling factor for Kapton background subtraction.
+    """
+    indices = np.where(
+        (x_range >= BACKGROUND_MATCH_POSITION - BACKGROUND_SEARCH_RANGE)
+        & (x_range <= BACKGROUND_MATCH_POSITION + BACKGROUND_SEARCH_RANGE)
+    )[0]
+
+    if len(indices) == 0:
+        raise ValueError("No matching x-range found for background scaling.")
+
+    nearest_index = indices[
+        np.argmin(
+            np.abs(x_range[indices] - BACKGROUND_MATCH_POSITION)
+        )
+    ]
+
+    return (
+        sample_profile[nearest_index]
+        / blank_profile[nearest_index]
+    )
+
+
+def apply_snip_baseline(
+    x_range: np.ndarray,
+    profile: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply SNIP baseline correction.
+    """
+    baseline_fitter = Baseline(x_range, check_finite=False)
+
+    baseline = baseline_fitter.snip(
+        profile,
+        max_half_window=SNIP_HALF_WINDOW,
+        decreasing=True,
+        smooth_half_window=SNIP_SMOOTH_WINDOW,
+    )[0]
+
+    corrected_profile = profile - baseline
+
+    return baseline, corrected_profile
+
+ 
+def export_corrected_profile(
+    output_path: Path,
+    x_range: np.ndarray,
+    corrected_profile: np.ndarray,
+) -> None:
+    """
+    Export corrected scattering profile to CSV.
+    """
+    with output_path.open("w", newline="") as csv_file:
+
+        writer = csv.writer(csv_file)
+
+        for x_value, y_value in zip(x_range, corrected_profile):
+            writer.writerow([x_value, y_value])
+
+
+def plot_processing_results(
+    sample_name: str,
+    x_range: np.ndarray,
+    background: np.ndarray,
+    corrected_sample: np.ndarray,
+    baseline: np.ndarray,
+    corrected_minus_baseline: np.ndarray,
+    output_path: Path,
+) -> None:
+    """
+    Plot processing workflow for one sample.
+    """
+    plt.figure(figsize=(8, 6))
+    plt.plot(
+        x_range,
+        corrected_sample + background,
+        label="Interpolated Data",
+        linestyle="-",)
+    plt.plot(x_range, background, label="Scaled Kapton Background")
+    plt.plot(x_range, corrected_sample, label="Background Corrected")
+    plt.plot(x_range, baseline, label="SNIP Baseline")
+    plt.plot(
+        x_range,
+        corrected_minus_baseline,
+        label="Corrected - Baseline",
+        linestyle="--",
+    )
+    plt.axhline(
+        y=0,
+        color="black",
+        linestyle=":",
+        linewidth=1,
+    )
+
+    plt.xlabel(r"2$\theta$ (°)")
+    plt.ylabel("Intensity")
+    plt.xlim(2.4, 45) #adjust as needed
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def main() -> None:
+    """
+    Run WAXS background subtraction and baseline correction workflow.
+    """
+    grouped_profiles = group_profiles_by_sample(DATA_DIR)
+
+    blank_profiles = []
+    blank_count = 0
+
+    # First pass: average blank measurements
+    for sample_name, profiles in grouped_profiles.items():
+
+        x_range, averaged_profile = interpolate_profiles(profiles)
+
+        if sample_name == "blank1":
+            blank_profiles.append(averaged_profile)
+            blank_count += 1
+
+    blank_average = np.mean(blank_profiles, axis=0)
+
+    # Second pass: process all non-blank samples
+    for sample_name, profiles in grouped_profiles.items():
+
+        if sample_name == "blank1":
+            continue
+
+        print(f"Processing {sample_name}")
+
+        x_range, averaged_profile = interpolate_profiles(profiles)
+
+        scale_factor = calculate_background_scaling(
+            x_range,
+            averaged_profile,
+            blank_average,
+        )
+
+        scaled_background = scale_factor * blank_average
+
+        background_corrected = averaged_profile - scaled_background
+
+        baseline, corrected_minus_baseline = apply_snip_baseline(
+            x_range,
+            background_corrected,
+        )
+
+        csv_output = (
+            CSV_OUTPUT_DIR
+            / f"{sample_name}_corrected_minus_baseline.csv"
+        )
+
+        export_corrected_profile(
+            csv_output,
+            x_range,
+            corrected_minus_baseline,
+        )
+
+        plot_output = (
+            PLOT_OUTPUT_DIR
+            / f"{sample_name}_plot.png"
+        )
+
+        plot_processing_results(
+            sample_name,
+            x_range,
+            scaled_background,
+            background_corrected,
+            baseline,
+            corrected_minus_baseline,
+            plot_output,
+        )
+
+    print("WAXS processing complete.")
+
+
+if __name__ == "__main__":
+    main()
