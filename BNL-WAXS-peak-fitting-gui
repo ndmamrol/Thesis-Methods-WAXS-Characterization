@@ -1,0 +1,240 @@
+"""
+Interactive WAXS peak fitting and crystallinity analysis.
+
+This script:
+1. Loads corrected WAXS CSV files.
+2. Lets the user manually define the amorphous Gaussian peak.
+3. Lets the user manually define and adjust crystalline peaks.
+4. Fits crystalline and amorphous peaks.
+5. Calculates crystallinity and R².
+6. Saves peak-fitting plots and output CSV files.
+"""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+import gaussian_peak as gp
+import lorentzian_peaks as lp
+import peak_fitting as pf
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+DATA_DIR = Path(
+)
+
+OUTPUT_DIR = Path()
+
+SUMMARY_CSV = OUTPUT_DIR / "20260326_xtal_summary.csv"
+
+Q_RANGE = [q1,q2]
+
+START_SAMPLE = 1
+END_SAMPLE = START_SAMPLE + #
+
+
+def get_sample_names(data_dir: Path) -> list[str]:
+    """Return corrected WAXS sample names, excluding blank files."""
+    return sorted(
+        file_path.stem
+        for file_path in data_dir.glob("*.csv")
+        if "blank" not in file_path.name.lower()
+    )
+
+
+def load_corrected_profile(file_path: Path) -> pd.DataFrame:
+    """Load corrected WAXS profile and rename columns."""
+    data = pd.read_csv(file_path)
+    data = data.iloc[:, :2].copy()
+    data.columns = ["x", "mean_y"]
+
+    return data
+
+
+def save_fit_outputs(
+    output_dir: Path,
+    sample_name: str,
+    crystallinity: np.ndarray,
+    peaks: pd.DataFrame,
+    r_squared: np.ndarray,
+    figs: list,
+) -> None:
+    """Save peak-fitting outputs for one sample."""
+    sample_output_dir = output_dir / sample_name
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
+
+    peaks.to_csv(
+        sample_output_dir / f"{sample_name}_peak_fitting.csv",
+        index=False,
+    )
+
+    np.savetxt(
+        sample_output_dir / f"{sample_name}_crystallinity.csv",
+        np.atleast_1d(np.asarray(crystallinity)),
+        delimiter=",",
+    )
+
+    np.savetxt(
+        sample_output_dir / f"{sample_name}_rsquare.csv",
+        np.atleast_1d(np.asarray(r_squared)),
+        delimiter=",",
+    )
+
+    for figure_index, fig in enumerate(figs):
+        fig.savefig(
+            sample_output_dir / f"{sample_name}_{figure_index}_peak_fitting.pdf",
+            bbox_inches="tight",
+        )
+        fig.savefig(
+            sample_output_dir / f"{sample_name}_{figure_index}_peak_fitting.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+
+def summarize_crystallinity(
+    sample_name: str,
+    crystallinity: np.ndarray,
+) -> dict[str, float | int | str]:
+    """Calculate mean and standard deviation of replicate crystallinity."""
+    crystallinity = np.atleast_1d(np.asarray(crystallinity))
+
+    # If fit_all_reps appends an average/summary value at the end, exclude it.
+    replicate_values = (
+        crystallinity[:-1]
+        if len(crystallinity) > 1
+        else crystallinity
+    )
+
+    return {
+        "Polymer": sample_name,
+        "n_replicates": len(replicate_values),
+        "mean_crystallinity": float(np.mean(replicate_values)),
+        "std_crystallinity": float(np.std(replicate_values)),
+    }
+
+
+def analyze_sample(
+    sample_name: str,
+    data_dir: Path,
+    output_dir: Path,
+) -> dict[str, float | int | str] | None:
+    """Run interactive peak selection and fitting for one sample."""
+    print(f"Processing sample: {sample_name}")
+
+    profile_path = data_dir / f"{sample_name}.csv"
+    final_data = load_corrected_profile(profile_path)
+
+    sample_output_dir = output_dir / sample_name
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: manually define amorphous Gaussian peak.
+    gaussian_peak = gp.manual_gaussian_addition(
+        final_data["x"],
+        final_data["mean_y"],
+    )
+
+    if gaussian_peak is None or len(gaussian_peak) == 0:
+        print("No Gaussian selected; skipping sample.")
+        return None
+
+    # Step 2: manually define crystalline peaks.
+    crystalline_peaks = lp.interactive_peak_editor(
+        final_data["x"],
+        final_data["mean_y"],
+        initial_peaks=None,
+    )
+
+    if crystalline_peaks is None or len(crystalline_peaks) == 0:
+        print("No crystalline peaks confirmed; skipping sample.")
+        return None
+
+    # Step 3: adjust crystalline peaks.
+    adjusted_crystalline_peaks = lp.interactive_peak_editor(
+        final_data["x"],
+        final_data["mean_y"],
+        initial_peaks=crystalline_peaks,
+    )
+
+    if adjusted_crystalline_peaks is None or len(adjusted_crystalline_peaks) == 0:
+        print("Adjusted crystalline peaks not confirmed; skipping sample.")
+        return None
+
+    # Step 4: final review of crystalline + amorphous peak set.
+    initial_peaks = pf.interactive_peak_editor(
+        final_data["x"],
+        final_data["mean_y"],
+        adjusted_crystalline_peaks,
+        gaussian_peak,
+    )
+
+    if initial_peaks is None or len(initial_peaks) == 0:
+        print("Final peak review cancelled; skipping sample.")
+        return None
+
+    initial_peaks.to_csv(
+        sample_output_dir / f"{sample_name}_initial_peaks.csv",
+        index=False,
+    )
+
+    # Step 5: fit all peaks.
+    crystallinity, peaks, r_squared, figs, _ = pf.fit_all_reps(
+        final_data,
+        initial_peaks,
+        Q_RANGE,
+        return_plot=True,
+        show=True,
+        fix_last_gaussian=True,
+    )
+
+    save_fit_outputs(
+        output_dir,
+        sample_name,
+        crystallinity,
+        peaks,
+        r_squared,
+        figs,
+    )
+
+    return summarize_crystallinity(sample_name, crystallinity)
+
+
+def main() -> None:
+    """Run interactive WAXS crystallinity analysis."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    sample_names = get_sample_names(DATA_DIR)
+
+    for index, sample_name in enumerate(sample_names, start=1):
+        print(index, sample_name)
+
+    selected_samples = sample_names[START_SAMPLE:END_SAMPLE]
+
+    results = []
+
+    for sample_name in selected_samples:
+        try:
+            result = analyze_sample(sample_name, DATA_DIR, OUTPUT_DIR)
+
+            if result is not None:
+                results.append(result)
+
+        except FileNotFoundError:
+            print(f"File not found for {sample_name}; skipping.")
+
+        except Exception as error:
+            print(f"Error processing {sample_name}: {error}")
+
+    if results:
+        pd.DataFrame(results).to_csv(SUMMARY_CSV, index=False)
+
+    print("Interactive WAXS peak fitting complete.")
+
+
+if __name__ == "__main__":
+    main()
