@@ -1,0 +1,296 @@
+"""
+Fit WAXS scattering profiles with Lorentzian crystalline peaks and
+a Gaussian amorphous halo.
+
+This script:
+1. Loads baseline-corrected WAXS CSV files.
+2. Fits multiple Lorentzian peaks and one Gaussian peak.
+3. Calculates peak areas and goodness-of-fit values.
+4. Exports fitted parameters, peak areas, fitted curves, and diagnostic plots.
+"""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+DATA_DIR = Path()
+
+FILE_PREFIX = "abcdef"
+FILE_PATTERN = "*.csv"
+
+X_MIN_FIT = 2.5
+
+NUM_LORENTZIAN_PEAKS = 1 #adjust
+NUM_GAUSSIAN_PEAKS = 1
+
+FILES_TO_SKIP: list[str] = []
+
+
+# Initial guesses: [amplitude, center, width]
+INITIAL_GUESSES = np.array([
+    [#, #, #], # Lorzentian peak 1; add as necessary
+    [#, #, #],  # Gaussian amorphous halo
+])
+
+
+def gaussian(x: np.ndarray, amplitude: float, center: float, sigma: float) -> np.ndarray:
+    """Return a Gaussian peak."""
+    return amplitude * np.exp(-((x - center) ** 2) / (2 * sigma**2))
+
+
+def lorentzian(x: np.ndarray, amplitude: float, center: float, gamma: float) -> np.ndarray:
+    """Return a Lorentzian peak."""
+    return (amplitude * gamma**2) / ((x - center) ** 2 + gamma**2)
+
+
+def peak_area(params: np.ndarray, peak_type: str) -> float:
+    """Calculate approximate peak area."""
+    amplitude, _, width = params
+
+    if peak_type == "lorentzian":
+        return amplitude * width * np.pi
+
+    if peak_type == "gaussian":
+        return amplitude * width * np.sqrt(2 * np.pi)
+
+    raise ValueError("peak_type must be 'lorentzian' or 'gaussian'.")
+
+
+def calculate_goodness_of_fit(
+    y_data: np.ndarray,
+    fitted_curve: np.ndarray,
+) -> tuple[float, float]:
+    """Calculate sum of squared residuals and R²."""
+    residuals = y_data - fitted_curve
+    ssr = np.sum(residuals**2)
+    sst = np.sum((y_data - np.mean(y_data)) ** 2)
+    r_squared = 1 - (ssr / sst)
+
+    return ssr, r_squared
+
+
+def build_bounds(initial_guesses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Create lower and upper bounds for peak fitting."""
+    lower_bounds = []
+    upper_bounds = []
+
+    # Lorentzian peaks
+    for amplitude, center, width in initial_guesses[:-1]:
+        lower_bounds.extend([max(0, amplitude - 500), center - 0.2, width - 0.5])
+        upper_bounds.extend([amplitude + 500, center + 0.2, width + 0.5])
+
+    # Gaussian amorphous halo
+    lower_bounds.extend([750, 16.0, 2.3])
+    upper_bounds.extend([3000, 17.0, 2.7])
+
+    return np.array(lower_bounds), np.array(upper_bounds)
+
+
+def total_fit_function(x: np.ndarray, *params: float) -> np.ndarray:
+    """Sum Lorentzian crystalline peaks and one Gaussian amorphous halo."""
+    params = np.array(params)
+
+    lorentzian_sum = np.zeros_like(x)
+
+    for i in range(0, len(params) - 3, 3):
+        lorentzian_sum += lorentzian(x, *params[i:i + 3])
+
+    gaussian_peak = gaussian(x, *params[-3:])
+
+    return lorentzian_sum + gaussian_peak
+
+
+def load_profile(file_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load x and intensity data from a two-column CSV file."""
+    data = np.genfromtxt(file_path, delimiter=",", skip_header=1)
+
+    x_data = data[:, 0]
+    y_data = data[:, 1]
+
+    mask = x_data >= X_MIN_FIT
+
+    return x_data[mask], y_data[mask]
+
+
+def fit_profile(
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+) -> dict[str, object]:
+    """Fit WAXS profile and return fitted curves, parameters, and metrics."""
+    initial_params = INITIAL_GUESSES.flatten()
+    lower_bounds, upper_bounds = build_bounds(INITIAL_GUESSES)
+
+    fitted_params, _ = curve_fit(
+        total_fit_function,
+        x_data,
+        y_data,
+        p0=initial_params,
+        bounds=(lower_bounds, upper_bounds),
+        maxfev=100_000,
+    )
+
+    lorentzian_params = fitted_params[:-3].reshape(-1, 3)
+    gaussian_params = fitted_params[-3:]
+
+    lorentzian_curves = {
+        f"Lorentzian_Peak_{i + 1}": lorentzian(x_data, *params)
+        for i, params in enumerate(lorentzian_params)
+    }
+
+    gaussian_curve = gaussian(x_data, *gaussian_params)
+
+    fitted_curve = total_fit_function(x_data, *fitted_params)
+
+    ssr, r_squared = calculate_goodness_of_fit(y_data, fitted_curve)
+
+    return {
+        "lorentzian_params": lorentzian_params,
+        "gaussian_params": gaussian_params,
+        "lorentzian_curves": lorentzian_curves,
+        "gaussian_curve": gaussian_curve,
+        "fitted_curve": fitted_curve,
+        "ssr": ssr,
+        "r_squared": r_squared,
+    }
+
+
+def save_results(
+    file_path: Path,
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    results: dict[str, object],
+) -> None:
+    """Save fitted parameters, curves, peak areas, and goodness-of-fit data."""
+    output_dir = file_path.parent / f"{file_path.stem}-analysis"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    lorentzian_params = results["lorentzian_params"]
+    gaussian_params = results["gaussian_params"]
+
+    peak_labels = [
+        f"Lorentzian Peak {i + 1}"
+        for i in range(len(lorentzian_params))
+    ] + ["Gaussian Peak 1"]
+
+    all_params = np.vstack([lorentzian_params, gaussian_params])
+
+    pd.DataFrame(
+        INITIAL_GUESSES,
+        columns=["Amplitude", "Center", "Width"],
+    ).to_csv(output_dir / f"{file_path.stem}_initial_guesses.csv", index=False)
+
+    pd.DataFrame(
+        all_params,
+        index=peak_labels,
+        columns=["Amplitude", "Center", "Width"],
+    ).to_csv(output_dir / f"{file_path.stem}_fitted_peak_parameters.csv")
+
+    areas = [
+        peak_area(params, "lorentzian")
+        for params in lorentzian_params
+    ] + [peak_area(gaussian_params, "gaussian")]
+
+    pd.DataFrame(
+        {
+            "Peak_Label": peak_labels,
+            "Peak_Area": areas,
+        }
+    ).to_csv(output_dir / f"{file_path.stem}_peak_areas.csv", index=False)
+
+    curve_df = pd.DataFrame(
+        {
+            "X": x_data,
+            "Y_Data": y_data,
+            "Fitted_Curve": results["fitted_curve"],
+            **results["lorentzian_curves"],
+            "Gaussian_Peak_1": results["gaussian_curve"],
+        }
+    )
+
+    curve_df.to_csv(output_dir / f"{file_path.stem}_fitted_curves.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "SSR": [results["ssr"]],
+            "R_squared": [results["r_squared"]],
+        }
+    ).to_csv(output_dir / f"{file_path.stem}_goodness_of_fit.csv", index=False)
+
+
+def plot_fit(
+    file_path: Path,
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    results: dict[str, object],
+) -> None:
+    """Save diagnostic plot of data, total fit, and individual peaks."""
+    output_dir = file_path.parent / f"{file_path.stem}-analysis"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(10, 6))
+
+    plt.scatter(x_data, y_data, label="Data", s=10)
+    plt.plot(x_data, results["fitted_curve"], label="Total Fit", linewidth=2)
+
+    for label, curve in results["lorentzian_curves"].items():
+        plt.plot(x_data, curve, linestyle="--", alpha=0.7, label=label)
+
+    plt.plot(
+        x_data,
+        results["gaussian_curve"],
+        linestyle="--",
+        alpha=0.7,
+        label="Gaussian Peak 1",
+    )
+
+    plt.xlabel("2θ or q")
+    plt.ylabel("Intensity")
+    plt.title(file_path.stem)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+
+    plt.savefig(output_dir / f"{file_path.stem}_fit.png", dpi=300)
+    plt.close()
+
+
+def process_file(file_path: Path) -> None:
+    """Load, fit, plot, and export results for one WAXS profile."""
+    print(f"Processing: {file_path.name}")
+
+    x_data, y_data = load_profile(file_path)
+    results = fit_profile(x_data, y_data)
+
+    save_results(file_path, x_data, y_data, results)
+    plot_fit(file_path, x_data, y_data, results)
+
+    print(
+        f"  SSR = {results['ssr']:.4g}, "
+        f"R² = {results['r_squared']:.4f}"
+    )
+
+
+def main() -> None:
+    """Run WAXS peak fitting analysis."""
+    csv_files = sorted(DATA_DIR.glob(FILE_PATTERN))
+
+    for file_path in csv_files:
+        if file_path.name in FILES_TO_SKIP:
+            continue
+
+        if not file_path.name.startswith(FILE_PREFIX):
+            continue
+
+        process_file(file_path)
+
+    print("Peak fitting complete.")
+
+
+if __name__ == "__main__":
+    main()
