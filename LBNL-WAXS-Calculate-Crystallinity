@@ -1,0 +1,114 @@
+"""
+Calculate WAXS-derived crystallinity from fitted peak areas.
+
+This script:
+1. Reads a master sample inventory CSV.
+2. Finds each sample's peak-fitting analysis folder.
+3. Loads the corresponding peak-area CSV file.
+4. Calculates crystallinity as:
+
+    crystallinity (%) = sum(Lorentzian peak areas) / total peak area × 100
+
+5. Saves the crystallinity value to both:
+   - the master inventory CSV
+   - an individual sample crystallinity CSV
+"""
+
+from pathlib import Path
+
+import pandas as pd
+
+
+# -----------------------------
+# User settings
+# -----------------------------
+XRD_DIR = Path()
+
+MASTER_CSV = XRD_DIR / ""
+
+SAMPLE_COLUMN = ""
+OUTPUT_COLUMN = ""
+PEAK_AREA_PATTERN = "*_all_peak_areas.csv"
+
+
+def calculate_crystallinity(peak_area_csv: Path) -> float:
+    """
+    Calculate crystallinity from fitted WAXS peak areas.
+
+    Lorentzian peaks are treated as crystalline contributions, while the
+    total peak area includes both crystalline Lorentzian peaks and the
+    amorphous Gaussian contribution.
+    """
+    peak_df = pd.read_csv(peak_area_csv)
+
+    crystalline_area = peak_df.loc[
+        peak_df["Peak_Label"].str.contains("Lorentzian Peak", na=False),
+        "Peak_Area",
+    ].sum()
+
+    total_area = peak_df["Peak_Area"].sum()
+
+    if total_area == 0:
+        return 0.0
+
+    return round((crystalline_area / total_area) * 100, 2)
+
+
+def find_peak_area_file(sample_analysis_dir: Path) -> Path | None:
+    """Find the fitted peak-area CSV file for a sample."""
+    matches = sorted(sample_analysis_dir.glob(PEAK_AREA_PATTERN))
+
+    if not matches:
+        return None
+
+    return matches[0]
+
+
+def save_sample_crystallinity(
+    sample_analysis_dir: Path,
+    sample_name: str,
+    crystallinity: float,
+) -> None:
+    """Save crystallinity result for one sample."""
+    output_file = sample_analysis_dir / f"{sample_name}_crystallinity_analysis.csv"
+
+    pd.DataFrame(
+        {OUTPUT_COLUMN: [crystallinity]}
+    ).to_csv(output_file, index=False)
+
+
+def update_master_crystallinity(master_csv: Path) -> None:
+    """Update master inventory with WAXS-derived crystallinity values."""
+    master_df = pd.read_csv(master_csv)
+
+    for index, row in master_df.iterrows():
+        sample_name = row[SAMPLE_COLUMN]
+        sample_analysis_dir = XRD_DIR / f"{sample_name}-analysis"
+
+        peak_area_file = find_peak_area_file(sample_analysis_dir)
+
+        if peak_area_file is None:
+            crystallinity = 0.0
+            print(f"No peak-area file found for {sample_name}; setting to 0.")
+        else:
+            crystallinity = calculate_crystallinity(peak_area_file)
+            print(f"{sample_name}: {crystallinity}%")
+
+            save_sample_crystallinity(
+                sample_analysis_dir,
+                sample_name,
+                crystallinity,
+            )
+
+        master_df.at[index, OUTPUT_COLUMN] = crystallinity
+
+    master_df.to_csv(master_csv, index=False)
+
+
+def main() -> None:
+    """Run crystallinity calculation workflow."""
+    update_master_crystallinity(MASTER_CSV)
+
+
+if __name__ == "__main__":
+    main()
